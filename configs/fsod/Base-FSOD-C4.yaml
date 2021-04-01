@@ -13,11 +13,16 @@ MODEL:
   BACKBONE:
     FREEZE_AT: 3
   #PIXEL_MEAN: [102.9801, 115.9465, 122.7717]
+OURS: # by Zhiyuan Ma
+  SUPPORT_FEATURE_ON: False
+  GT_FEATURE_ON: False
+  PROPOSAL_FEATURE_ON: False
+  MASK_ON: False
 DATASETS:
   TRAIN: ("coco_2017_train_nonvoc",) #("coco_2017_train",)
   TEST: ("coco_2017_val",)
 DATALOADER:
-  NUM_WORKERS: 8
+  NUM_WORKERS: 4
 SOLVER:
   IMS_PER_BATCH: 8 #16
   BASE_LR: 0.004 #0.02

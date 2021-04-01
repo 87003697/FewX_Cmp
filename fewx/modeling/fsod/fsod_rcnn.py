@@ -19,6 +19,8 @@ from detectron2.modeling.poolers import ROIPooler
 import torch.nn.functional as F
 
 from .fsod_fast_rcnn import FsodFastRCNNOutputs
+from .supcon import SupConLoss
+
 
 import os
 
@@ -29,6 +31,8 @@ from detectron2.data.catalog import MetadataCatalog
 import detectron2.data.detection_utils as utils
 import pickle
 import sys
+
+import pdb
 
 __all__ = ["FsodRCNN"]
 
@@ -60,6 +64,13 @@ class FsodRCNN(nn.Module):
         self.support_way = cfg.INPUT.FS.SUPPORT_WAY
         self.support_shot = cfg.INPUT.FS.SUPPORT_SHOT
         self.logger = logging.getLogger(__name__)
+
+        # by Zhiyuan Ma ############
+        self.support_feature_on = cfg.OURS.SUPPORT_FEATURE_ON
+        self.gt_feature_on = cfg.OURS.GT_FEATURE_ON
+        self.prposal_feature_on = cfg.OURS.PROPOSAL_FEATURE_ON
+        self.mask_on = cfg.OURS.PROPOSAL_FEATURE_ON
+        self.supcon_on = self.support_feature_on or self.gt_feature_on or self.prposal_feature_on
 
     @property
     def device(self):
@@ -162,6 +173,20 @@ class FsodRCNN(nn.Module):
         detector_loss_box_reg = []
         rpn_loss_rpn_cls = []
         rpn_loss_rpn_loc = []
+
+        # Modification by Zhiyuan Ma ###########
+        self.CROP_SHAPE = batched_inputs[0]['support_images'].shape
+
+        images_perbatch = []
+        image_exist_ls = []
+
+        # get support/gt cropped features, and labels
+        gt_features, support_features, labels = self.hard_crop_features(batched_inputs)
+        gt_features = gt_features if self.gt_feature_on else []
+        support_features = support_features if self.support_feature_on else []
+        #################################################
+
+
         for i in range(B): # batch
             # query
             query_gt_instances = [gt_instances[i]] # one query gt instances
@@ -234,7 +259,74 @@ class FsodRCNN(nn.Module):
             rpn_loss_rpn_loc.append(proposal_losses['loss_rpn_loc'])
             detector_loss_cls.append(detector_losses['loss_cls'])
             detector_loss_box_reg.append(detector_losses['loss_box_reg'])
+            
+            ####Soft Cropping by Zhiyuan Ma ############################################ 
+            # get proposal_features
+            if self.prposal_feature_on:
+                gt_boxes = gt_instances[i].gt_boxes.tensor
+                proposal_boxes = [p.proposal_boxes for p in pos_detector_proposals]
+                proposal_boxes = proposal_boxes[0].cat(proposal_boxes).tensor
+                final_boxes = self.b2b_trans.apply_deltas(pos_pred_proposal_deltas, proposal_boxes)
+                mode = self.SELECT
+                if mode == 'iou_proposal':
+                    image_perbatch = self._soft_crop(mode, images.tensor[i], final_boxes, [], gt_boxes) 
+                else: #mode == 'logit_proposal' 
+                    image_perbatch = self._soft_crop(mode, images.tensor[i], final_boxes, pos_pred_class_logits,[])    
+                images_perbatch += image_perbatch
+                image_exist_ls.append(True if image_perbatch != [] else False)
+                del gt_boxes, proposal_boxes, final_boxes, image_perbatch
+            else:
+                images_perbatch = []
         
+        # collect features 
+        try:
+            images_perbatch = torch.cat(images_perbatch)
+            proposal_features = self.backbone(images_perbatch)['res4']
+            proposal_features = self.roi_heads.res5(proposal_features)
+            proposal_features = nn.AdaptiveAvgPool2d((1, 1))(proposal_features)
+            proposal_features = F.normalize(proposal_features, p=2, dim=1)
+            proposal_features_ls, cnt = [], 0
+            for i in range(B):
+                if image_exist_ls[i] == False: # No proposal image
+                    proposal_features_ls.append(None)
+                else:
+                    start,end = cnt * self.IMG_PERINS, (cnt + 1) * self.IMG_PERINS
+                    proposal_feature = proposal_features[start:end]
+                    proposal_features_ls.append(proposal_feature)
+                    cnt += 1
+            proposal_features = proposal_features_ls
+
+            features_batch, labels_batch = [], []
+            for gt_feature, support_feature, proposal_feature, label in zip(gt_features, support_features, proposal_features, labels):
+                if proposal_feature is not None:# No proposal image
+                    features_perins = torch.cat([gt_feature, support_feature, proposal_feature])
+                else:
+                    features_perins = torch.cat([gt_feature, support_feature])
+                label_perins = [label.unsqueeze(0)] * features_perins.shape[0]
+                features_batch.append(features_perins)
+                labels_batch += label_perins
+            del gt_instances, gt_features, support_features, proposal_features
+
+        except: #images_perbatch is empty
+            features_batch, labels_batch = [], []
+            for gt_feature, support_feature, label in zip(gt_features, support_features, labels):
+                features_perins = torch.cat([gt_feature, support_feature])
+                label_perins = [label.unsqueeze(0)] * features_perins.shape[0]
+                features_batch.append(features_perins)
+                labels_batch += label_perins
+            del gt_instances, gt_features, support_features
+
+        # Supcon 
+        if self.supcon_on:
+            features_batch = torch.cat(features_batch)   
+            labels_batch = torch.cat(labels_batch)
+            SupCon = SupConLoss(contrast_mode = 'all') 
+            detector_loss_supcon = SupCon(features = features_batch.unsqueeze(1), labels = labels_batch)
+            del features_batch, labels_batch, images, batched_inputs
+        
+        ####################################################################
+ 
+
         proposal_losses = {}
         detector_losses = {}
 
@@ -243,78 +335,235 @@ class FsodRCNN(nn.Module):
         detector_losses['loss_cls'] = torch.stack(detector_loss_cls).mean() 
         detector_losses['loss_box_reg'] = torch.stack(detector_loss_box_reg).mean()
 
-
+        if self.supcon_on:
+            detector_losses['loss_supcon'] =  detector_loss_supcon
         losses = {}
         losses.update(detector_losses)
         losses.update(proposal_losses)
         return losses
 
+    
+    def hard_crop_features(self, batched_inputs):
+        gt_features, support_features, labels = [], [], []
+        for item in batched_inputs:
+            gt_box = item['instances'].gt_boxes
+            gt_img = item['image']
+            gt_img = (gt_img.to(self.device) - self.pixel_mean) / self.pixel_std # Normalize input!
+            gt_crop_img = self._hard_crop(gt_img, gt_box.tensor)
+            gt_num = gt_crop_img[0].shape[0]
+            gt_avg_flag = False if gt_num == 1 else True # In case there are many gt instances
+            gt_label = item['instances'].gt_classes[0]
+
+            support_crop_imgs = []
+            support_boxes = item['support_bboxes']
+            support_imgs = item['support_images']
+            support_labels = item['support_cls']
+            for support_box, support_img, support_label in zip(support_boxes,
+                                                                support_imgs, support_labels):
+                if support_label == 0:
+                    support_box = torch.tensor(support_box).unsqueeze(0)
+                    support_img = (support_img.to(self.device) - self.pixel_mean) / self.pixel_std # Normalize input!
+                    support_crop_imgs += self._hard_crop(support_img, support_box)
+            crop_imgs = gt_crop_img + support_crop_imgs
+            crop_imgs = torch.cat(crop_imgs).to(self.device)
+            crop_features = self.backbone(crop_imgs)['res4']
+            crop_features = self.roi_heads.res5(crop_features)
+            crop_features = nn.AdaptiveAvgPool2d((1, 1))(crop_features) # global avg pool
+            crop_features = F.normalize(crop_features, p=2, dim=1)
+            gt_features.append(crop_features[:gt_num])
+            support_features.append(crop_features[gt_num:])
+            labels.append(gt_label)
+
+            del gt_crop_img, support_crop_imgs, crop_imgs, crop_features
+            del gt_img, support_img
+        del batched_inputs
+        return gt_features, support_features, labels
+
+    def _hard_crop(self, image_tensor, final_boxes): # for gt and support images
+        t_x1, t_y1, t_x2, t_y2 = final_boxes[:,0], final_boxes[:,1], final_boxes[:,2], final_boxes[:,3]
+        image = image_tensor
+        idx_x1 = torch.ceil(t_x1).cpu().detach().numpy().astype(int)
+        idx_x2 = torch.floor(t_x2).cpu().detach().numpy().astype(int) 
+        idx_y1 = torch.ceil(t_y1).cpu().detach().numpy().astype(int)
+        idx_y2 = torch.floor(t_y2).cpu().detach().numpy().astype(int) 
+        
+
+        # image cropping 
+        images_crop, images_resz = [], []
+        for j in range(final_boxes.shape[0]):
+            assert idx_y2[j] <=  image.shape[1] and idx_x2[j] <=  image.shape[2]
+            image_crop = image[:,idx_y1[j]: idx_y2[j],idx_x1[j]: idx_x2[j] ].unsqueeze(0)
+            images_crop.append(image_crop)
+            orig_size, out_size = image_crop.shape[2:4], self.CROP_SHAPE[2:4]#[H,W]#image_tensor.shape[1:3]
+            image_resz = nn.functional.interpolate(image_crop, out_size)
+            images_resz.append(image_resz)
+        images_resz = torch.cat(images_resz)
+
+        del images_crop,  final_boxes
+        return [images_resz]
+
+    def _soft_crop(self,mode, image_tensor, final_boxes, pos_pred_class_logits,gt_boxes):
+        if mode == 'logit_proposal': # don't use, maybe wrong
+            sorted_logits, indices = torch.sort(pos_pred_class_logits[:,0], descending=True)
+            final_boxes = final_boxes[indices]
+        elif mode == 'iou_proposal':
+            orig_length = final_boxes.shape[0]
+            try:
+                ious = self._cal_iou(final_boxes, gt_boxes).view(-1)
+            except:
+                ious, idx = torch.max(self._cal_iou(final_boxes, gt_boxes),dim = 1)
+            sorted, indices = torch.sort(ious, descending=True)
+            iou_mask = (sorted > self.IOU_THRES).view(-1)
+            final_boxes = final_boxes[indices[iou_mask]]
+            length = final_boxes.shape[0]
+            if length <= self.IMG_PERINS: # no crop satisifies iou condition
+                # print('No cropping with iou > {}, mode: '.format(IOU_THRES),mode)
+                return []
+            # else:
+            #     print('{}/{} bboxes with iou >{}'.format(length, orig_length, IOU_THRES))
+        if mode == 'iou_proposal':
+            select_mode = 'reshape' 
+        elif mode == 'logit_proposal':
+            select_mode = 'delete'
+
+        if select_mode == 'delete':
+            # filter out idxes that exceeding bounds
+            height, width = image_tensor.shape[1], image_tensor.shape[2]
+            sorted_logits = pos_pred_class_logits[indices]
+            logit_mask = sorted_logits[:,0] >= sorted_logits[:,1] # find fore-ground proposals
+            bound_mask = final_boxes[:,0] >= 0
+            bound_mask *= final_boxes[:,0] <= width - 1 # -1 is because index starts from 0
+            bound_mask *= final_boxes[:,2] <= width - 1
+            bound_mask *= final_boxes[:,1] >= 0
+            bound_mask *= final_boxes[:,1] <= height - 1
+            bound_mask *= final_boxes[:,3] <= height - 1
+            # bound_mask *= (final_boxes[:,2] -  final_boxes[:,0]) *  (final_boxes[:,3] -  final_boxes[:,1]) >= 4 # any small number >0
+            bound_mask *= final_boxes[:,2] -  final_boxes[:,0] >= 2  # any small number >0, in case a small bbox
+            bound_mask *= final_boxes[:,3] -  final_boxes[:,1] >= 2
+
+            mask = logit_mask * bound_mask
+            final_boxes = final_boxes[mask]
+
+            device,length = self.device, final_boxes.shape[0]
+            if length <= self.IMG_PERINS: # no crop is within bound
+                # print('No cropping within bound, mode: ',mode)
+                return []
+        elif select_mode == 'reshape':
+            # reshape filter to be within bound
+            height, width = image_tensor.shape[1], image_tensor.shape[2]
+            final_boxes_old = final_boxes
+            final_boxes_lb = torch.max(torch.zeros_like(final_boxes), final_boxes)
+            final_boxes_xs = torch.min(torch.ones_like(final_boxes[:,0::2]) * (width - 1), final_boxes_lb[:,0::2]) # -1 is because index start from 0
+            final_boxes_ys = torch.min(torch.ones_like(final_boxes[:,1::2]) * (height - 1), final_boxes_lb[:,1::2])
+            
+            final_boxes = torch.vstack([final_boxes_xs[:,0], final_boxes_ys[:,0], final_boxes_xs[:,1], final_boxes_ys[:,1]])
+            final_boxes = torch.transpose(final_boxes, 0, 1)
+
+            bound_mask = final_boxes[:,2] -  final_boxes[:,0] >= 2  # any small number >0, in case a small bbox
+            bound_mask *= final_boxes[:,3] -  final_boxes[:,1] >= 2
+            final_boxes = final_boxes[bound_mask] # sorry for making it complicate, but sometimes it happens
+
+            device,length = self.device, final_boxes.shape[0]
+            if length <= self.IMG_PERINS: # no crop left
+                # print('No cropping within bound, mode: ',mode)
+                return []
+
+            # print('{} indices were calibrated'.format(torch.sum(final_boxes_old == final_boxes_old) - torch.sum(final_boxes_old == final_boxes)))
+
+        #soft cropping        
+        t_x1, t_y1, t_x2, t_y2 = final_boxes[:,0], final_boxes[:,1], final_boxes[:,2], final_boxes[:,3]
+        device,length = self.device, final_boxes.shape[0]
+
+        mask_1_raw = torch.tensor([float(j) for j in range(width)]).unsqueeze(0).to(device)
+        mask_1_raw = torch.cat([mask_1_raw] * length, axis = 0)
+        mask_2_raw = torch.tensor([float(j) for j in range(height)]).unsqueeze(0).to(device)
+        mask_2_raw = torch.cat([mask_2_raw] * length, axis = 0)
+        if self.NORM:
+            mask_1 = self._carbox((mask_1_raw - t_x1.unsqueeze(1)) / width) - self._carbox((mask_1_raw - t_x2.unsqueeze(1)) /width)
+            mask_2 = self._carbox((mask_2_raw - t_y1.unsqueeze(1)) / height) - self._carbox((mask_2_raw - t_y2.unsqueeze(1)) /height)
+        else:
+            mask_1 = self._carbox(mask_1_raw - t_x1.unsqueeze(1)) - self._carbox(mask_1_raw - t_x2.unsqueeze(1))
+            mask_2 = self._carbox(mask_2_raw - t_y1.unsqueeze(1)) - self._carbox(mask_2_raw - t_y2.unsqueeze(1))
+        mask_1_T = torch.unsqueeze(mask_1, 1)
+        mask_2_T = torch.unsqueeze(mask_2, -1)
+        mask = torch.matmul(mask_2_T,mask_1_T)
+        del mask_1_raw, mask_2_raw, mask_1,  mask_2, mask_1_T, mask_2_T
+        
+        tmp_1, tmp_2, tmp_3 = mask * image_tensor[0], mask * image_tensor[1], mask * image_tensor[2]
+        image_att = torch.cat([tmp_1.unsqueeze(1), tmp_2.unsqueeze(1), tmp_3.unsqueeze(1)], axis = 1)
+        del mask, tmp_1, tmp_2, tmp_3
+        
+        idx_x1 = torch.ceil(t_x1).cpu().detach().numpy().astype(int)
+        idx_x2 = torch.floor(t_x2).cpu().detach().numpy().astype(int) 
+        idx_y1 = torch.ceil(t_y1).cpu().detach().numpy().astype(int)
+        idx_y2 = torch.floor(t_y2).cpu().detach().numpy().astype(int) 
+
+        # image cropping 
+        images_crop, images_resz = [], []
+        for j in range(self.IMG_PERINS):
+            image_crop = image_att[j,:,idx_y1[j]: idx_y2[j],idx_x1[j]: idx_x2[j] ].unsqueeze(0)
+            images_crop.append(image_crop)
+            orig_size, out_size = image_crop.shape[2:4], self.CROP_SHAPE[2:4]#[H,W]#image_tensor.shape[1:3]
+            image_resz = nn.functional.interpolate(image_crop, out_size)
+            images_resz.append(image_resz)
+        
+        images_perins = torch.cat(images_resz)
+        del images_crop, final_boxes, image_att
+                
+        return [images_perins]
+
     def init_model(self):
         self.support_on = True #False
 
-        support_dir = './support_dir'
-        if not os.path.exists(support_dir):
-            os.makedirs(support_dir)
-
-        support_file_name = os.path.join(support_dir, 'support_feature.pkl')
-        if not os.path.exists(support_file_name):
-            support_path = './datasets/coco/10_shot_support_df.pkl'
-            support_df = pd.read_pickle(support_path)
-
-            metadata = MetadataCatalog.get('coco_2017_train')
-            # unmap the category mapping ids for COCO
-            reverse_id_mapper = lambda dataset_id: metadata.thing_dataset_id_to_contiguous_id[dataset_id]  # noqa
-            support_df['category_id'] = support_df['category_id'].map(reverse_id_mapper)
-
-            support_dict = {'res4_avg': {}, 'res5_avg': {}}
-            for cls in support_df['category_id'].unique():
-                support_cls_df = support_df.loc[support_df['category_id'] == cls, :].reset_index()
-                support_data_all = []
-                support_box_all = []
-
-                for index, support_img_df in support_cls_df.iterrows():
-                    img_path = os.path.join('./datasets/coco', support_img_df['file_path'])
-                    support_data = utils.read_image(img_path, format='BGR')
-                    support_data = torch.as_tensor(np.ascontiguousarray(support_data.transpose(2, 0, 1)))
-                    support_data_all.append(support_data)
-
-                    support_box = support_img_df['support_box']
-                    support_box_all.append(Boxes([support_box]).to(self.device))
-
-                # support images
-                support_images = [x.to(self.device) for x in support_data_all]
-                support_images = [(x - self.pixel_mean) / self.pixel_std for x in support_images]
-                support_images = ImageList.from_tensors(support_images, self.backbone.size_divisibility)
-                support_features = self.backbone(support_images.tensor)
-
-                res4_pooled = self.roi_heads.roi_pooling(support_features, support_box_all)
-                res4_avg = res4_pooled.mean(0, True)
-                res4_avg = res4_avg.mean(dim=[2,3], keepdim=True)
-                support_dict['res4_avg'][cls] = res4_avg.detach().cpu().data
-
-                res5_feature = self.roi_heads._shared_roi_transform([support_features[f] for f in self.in_features], support_box_all)
-                res5_avg = res5_feature.mean(0, True)
-                support_dict['res5_avg'][cls] = res5_avg.detach().cpu().data
-
-                del res4_avg
-                del res4_pooled
-                del support_features
-                del res5_feature
-                del res5_avg
-
-            with open(support_file_name, 'wb') as f:
-               pickle.dump(support_dict, f)
-            self.logger.info("=========== Offline support features are generated. ===========")
-            self.logger.info("============ Few-shot object detetion will start. =============")
-            sys.exit(0)
+        if hasattr(self, 'support_dict'):
+            return
             
-        else:
-            with open(support_file_name, "rb") as hFile:
-                self.support_dict  = pickle.load(hFile, encoding="latin1")
-            for res_key, res_dict in self.support_dict.items():
-                for cls_key, feature in res_dict.items():
-                    self.support_dict[res_key][cls_key] = feature.cuda()
+        support_path = './datasets/coco/10_shot_support_df.pkl'
+        support_df = pd.read_pickle(support_path)
 
+        metadata = MetadataCatalog.get('coco_2017_train')
+        # unmap the category mapping ids for COCO
+        reverse_id_mapper = lambda dataset_id: metadata.thing_dataset_id_to_contiguous_id[dataset_id]  # noqa
+        support_df['category_id'] = support_df['category_id'].map(reverse_id_mapper)
+
+        support_dict = {'res4_avg': {}, 'res5_avg': {}}
+        for cls in support_df['category_id'].unique():
+            support_cls_df = support_df.loc[support_df['category_id'] == cls, :].reset_index()
+            support_data_all = []
+            support_box_all = []
+
+            for index, support_img_df in support_cls_df.iterrows():
+                img_path = os.path.join('./datasets/coco', support_img_df['file_path'])
+                support_data = utils.read_image(img_path, format='BGR')
+                support_data = torch.as_tensor(np.ascontiguousarray(support_data.transpose(2, 0, 1)))
+                support_data_all.append(support_data)
+
+                support_box = support_img_df['support_box']
+                support_box_all.append(Boxes([support_box]).to(self.device))
+
+            # support images
+            support_images = [x.to(self.device) for x in support_data_all]
+            support_images = [(x - self.pixel_mean) / self.pixel_std for x in support_images]
+            support_images = ImageList.from_tensors(support_images, self.backbone.size_divisibility)
+            support_features = self.backbone(support_images.tensor)
+
+            res4_pooled = self.roi_heads.roi_pooling(support_features, support_box_all)
+            res4_avg = res4_pooled.mean(0, True)
+            res4_avg = res4_avg.mean(dim=[2,3], keepdim=True)
+            support_dict['res4_avg'][cls] = res4_avg.detach() #res4_avg.detach().cpu().data
+
+            res5_feature = self.roi_heads._shared_roi_transform([support_features[f] for f in self.in_features], support_box_all)
+            res5_avg = res5_feature.mean(0, True)
+            support_dict['res5_avg'][cls] = res5_avg.detach() #res5_avg.detach().cpu().data
+
+            del res4_avg
+            del res4_pooled
+            del support_features
+            del res5_feature
+            del res5_avg
+
+        self.support_dict = support_dict
+            
     def inference(self, batched_inputs, detected_instances=None, do_postprocess=True):
         """
         Run inference on the given inputs.
