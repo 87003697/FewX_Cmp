@@ -33,6 +33,7 @@ import pickle
 import sys
 
 import pdb
+from detectron2.modeling.box_regression import Box2BoxTransform
 
 __all__ = ["FsodRCNN"]
 
@@ -66,11 +67,19 @@ class FsodRCNN(nn.Module):
         self.logger = logging.getLogger(__name__)
 
         # by Zhiyuan Ma ############
+        self.b2b_weight = cfg.MODEL.ROI_BOX_HEAD.BBOX_REG_WEIGHTS
+        self.b2b_trans = Box2BoxTransform(self.b2b_weight)
+
         self.support_feature_on = cfg.OURS.SUPPORT_FEATURE_ON
         self.gt_feature_on = cfg.OURS.GT_FEATURE_ON
         self.prposal_feature_on = cfg.OURS.PROPOSAL_FEATURE_ON
         self.mask_on = cfg.OURS.PROPOSAL_FEATURE_ON
         self.supcon_on = self.support_feature_on or self.gt_feature_on or self.prposal_feature_on
+        self.SELECT = cfg.OURS.SELECT 
+        self.IMG_PERINS = cfg.OURS.IMG_PERINS
+        self.NORM = cfg.OURS.NORM
+        self.IOU_THRES = cfg.OURS.IOU_THRES
+        self.CAR_BOX = cfg.OURS.CAR_BOX
 
     @property
     def device(self):
@@ -473,25 +482,27 @@ class FsodRCNN(nn.Module):
         #soft cropping        
         t_x1, t_y1, t_x2, t_y2 = final_boxes[:,0], final_boxes[:,1], final_boxes[:,2], final_boxes[:,3]
         device,length = self.device, final_boxes.shape[0]
-
-        mask_1_raw = torch.tensor([float(j) for j in range(width)]).unsqueeze(0).to(device)
-        mask_1_raw = torch.cat([mask_1_raw] * length, axis = 0)
-        mask_2_raw = torch.tensor([float(j) for j in range(height)]).unsqueeze(0).to(device)
-        mask_2_raw = torch.cat([mask_2_raw] * length, axis = 0)
-        if self.NORM:
-            mask_1 = self._carbox((mask_1_raw - t_x1.unsqueeze(1)) / width) - self._carbox((mask_1_raw - t_x2.unsqueeze(1)) /width)
-            mask_2 = self._carbox((mask_2_raw - t_y1.unsqueeze(1)) / height) - self._carbox((mask_2_raw - t_y2.unsqueeze(1)) /height)
-        else:
-            mask_1 = self._carbox(mask_1_raw - t_x1.unsqueeze(1)) - self._carbox(mask_1_raw - t_x2.unsqueeze(1))
-            mask_2 = self._carbox(mask_2_raw - t_y1.unsqueeze(1)) - self._carbox(mask_2_raw - t_y2.unsqueeze(1))
-        mask_1_T = torch.unsqueeze(mask_1, 1)
-        mask_2_T = torch.unsqueeze(mask_2, -1)
-        mask = torch.matmul(mask_2_T,mask_1_T)
-        del mask_1_raw, mask_2_raw, mask_1,  mask_2, mask_1_T, mask_2_T
+        if self.mask_on:
+            mask_1_raw = torch.tensor([float(j) for j in range(width)]).unsqueeze(0).to(device)
+            mask_1_raw = torch.cat([mask_1_raw] * length, axis = 0)
+            mask_2_raw = torch.tensor([float(j) for j in range(height)]).unsqueeze(0).to(device)
+            mask_2_raw = torch.cat([mask_2_raw] * length, axis = 0)
+            if self.NORM:
+                mask_1 = self._carbox((mask_1_raw - t_x1.unsqueeze(1)) / width) - self._carbox((mask_1_raw - t_x2.unsqueeze(1)) /width)
+                mask_2 = self._carbox((mask_2_raw - t_y1.unsqueeze(1)) / height) - self._carbox((mask_2_raw - t_y2.unsqueeze(1)) /height)
+            else:
+                mask_1 = self._carbox(mask_1_raw - t_x1.unsqueeze(1)) - self._carbox(mask_1_raw - t_x2.unsqueeze(1))
+                mask_2 = self._carbox(mask_2_raw - t_y1.unsqueeze(1)) - self._carbox(mask_2_raw - t_y2.unsqueeze(1))
+            mask_1_T = torch.unsqueeze(mask_1, 1)
+            mask_2_T = torch.unsqueeze(mask_2, -1)
+            mask = torch.matmul(mask_2_T,mask_1_T)
+            del mask_1_raw, mask_2_raw, mask_1,  mask_2, mask_1_T, mask_2_T
         
-        tmp_1, tmp_2, tmp_3 = mask * image_tensor[0], mask * image_tensor[1], mask * image_tensor[2]
-        image_att = torch.cat([tmp_1.unsqueeze(1), tmp_2.unsqueeze(1), tmp_3.unsqueeze(1)], axis = 1)
-        del mask, tmp_1, tmp_2, tmp_3
+            tmp_1, tmp_2, tmp_3 = mask * image_tensor[0], mask * image_tensor[1], mask * image_tensor[2]
+            image_att = torch.cat([tmp_1.unsqueeze(1), tmp_2.unsqueeze(1), tmp_3.unsqueeze(1)], axis = 1)
+            del mask, tmp_1, tmp_2, tmp_3
+        else:
+            image_att = image_tensor
         
         idx_x1 = torch.ceil(t_x1).cpu().detach().numpy().astype(int)
         idx_x2 = torch.floor(t_x2).cpu().detach().numpy().astype(int) 
@@ -511,6 +522,18 @@ class FsodRCNN(nn.Module):
         del images_crop, final_boxes, image_att
                 
         return [images_perins]
+
+    def _carbox(self, tensor, k = 10):
+        # return torch.sigmoid(k * tensor)
+        # return torch.relu(k*(tensor + 0.5)) - torch.relu(k*(tensor - 0.5))
+        assert self.CAR_BOX in ['relu', 'sigmoid','heaviside']
+        if self.CAR_BOX == 'relu':
+            return k * (torch.relu(tensor + 1 / (k * 2)) - torch.relu(tensor - 1 / (k * 2)))
+        elif self.CAR_BOX == 'sigmoid':
+            return torch.sigmoid(k * tensor)
+        else :
+            return torch.heaviside(tensor, torch.zeros_like(tensor).to(self.device))
+
 
     def init_model(self):
         self.support_on = True #False
@@ -640,7 +663,7 @@ class FsodRCNN(nn.Module):
             return images, support_images
         else:
             return images
-
+    
     @staticmethod
     def _postprocess(instances, batched_inputs, image_sizes):
         """

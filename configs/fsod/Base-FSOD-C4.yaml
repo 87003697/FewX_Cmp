@@ -14,10 +14,15 @@ MODEL:
     FREEZE_AT: 3
   #PIXEL_MEAN: [102.9801, 115.9465, 122.7717]
 OURS: # by Zhiyuan Ma
-  SUPPORT_FEATURE_ON: False
-  GT_FEATURE_ON: False
-  PROPOSAL_FEATURE_ON: False
+  SUPPORT_FEATURE_ON: True
+  GT_FEATURE_ON: True
+  PROPOSAL_FEATURE_ON: True
   MASK_ON: False
+  IMG_PERINS: 5 #args.img_perins
+  IOU_THRES: 0.8 #args.iou_thres
+  CAR_BOX: 'heaviside' #'sigmoid' #'heaviside'
+  SELECT: 'logit_proposal'
+  NORM: True
 DATASETS:
   TRAIN: ("coco_2017_train_nonvoc",) #("coco_2017_train",)
   TEST: ("coco_2017_val",)
