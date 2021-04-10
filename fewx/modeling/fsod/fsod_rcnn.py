@@ -410,6 +410,22 @@ class FsodRCNN(nn.Module):
 
         del images_crop,  final_boxes
         return [images_resz]
+        
+    def _cal_iou(self, final_boxes, gt_boxes):
+        x1, y1, x2, y2 = final_boxes[:, 0], final_boxes[:, 1], final_boxes[:, 2], final_boxes[:, 3]
+        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+        ious_list = []
+        for i in range(gt_boxes.shape[0]):
+            x1_t, y1_t, x2_t, y2_t = gt_boxes[i,0], gt_boxes[i,1], gt_boxes[i,2], gt_boxes[i,3]
+            areas_t = (x2_t - x1_t + 1) * (y2_t - y1_t + 1)
+            xx1, yy1, xx2, yy2 = torch.max(x1, x1_t), torch.max(y1, y1_t), torch.min(x2, x2_t), torch.min(y2, y2_t)
+            w = torch.max(torch.zeros_like(xx2 - xx1 + 1).to(self.device), xx2 - xx1 + 1)
+            h = torch.max(torch.zeros_like(yy2 - yy1 + 1).to(self.device), yy2 - yy1 + 1)
+            iou = (w * h) / (areas + areas_t - w * h) 
+            ious_list.append(iou)
+        ious = torch.vstack(ious_list)
+        ious = torch.transpose(ious,0,1)
+        return ious
 
     def _soft_crop(self,mode, image_tensor, final_boxes, pos_pred_class_logits,gt_boxes):
         if mode == 'logit_proposal': # don't use, maybe wrong
